@@ -1,0 +1,20 @@
+# Qdrant settings shared by every node. Environment variables (QDRANT__...) in
+# compose.yaml override or extend this file. See https://qdrant.tech/documentation/guides/configuration/
+storage:
+  storage_path: /qdrant/storage
+  snapshots_path: /qdrant/snapshots
+  # Keep points on disk's WAL and fsync-safe defaults. Raise the limits below
+  # only after reading the performance guide.
+  performance:
+    max_search_threads: 0   # 0 = auto
+
+service:
+  max_request_size_mb: 32
+  enable_cors: false
+
+cluster:
+  enabled: true
+  p2p:
+    port: 6335
+
+telemetry_disabled: true

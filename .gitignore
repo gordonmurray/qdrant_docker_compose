@@ -1,0 +1,5 @@
+.env
+secrets/*
+!secrets/.gitkeep
+backups/
+__pycache__/

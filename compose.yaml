@@ -1,0 +1,205 @@
+name: ${COMPOSE_PROJECT_NAME:-qdrant}
+
+x-qdrant: &qdrant
+  image: qdrant/qdrant:${QDRANT_VERSION:-v1.20.0}
+  restart: unless-stopped
+  stop_grace_period: 30s
+  init: true
+  ulimits:
+    nofile: { soft: 65535, hard: 65535 }
+  mem_limit: ${QDRANT_MEM_LIMIT:-2g}
+  cpus: ${QDRANT_CPUS:-2}
+  security_opt: [no-new-privileges:true]
+  entrypoint: [/qdrant/config/start.sh]
+  environment: &qdrant-env
+    BOOTSTRAP_URL: ""
+    QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-INFO}
+    QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?run `make init` first}
+    QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?run `make init` first}
+    QDRANT__STORAGE__COLLECTION__REPLICATION_FACTOR: ${QDRANT_DEFAULT_REPLICATION_FACTOR:-3}
+    QDRANT__STORAGE__COLLECTION__WRITE_CONSISTENCY_FACTOR: ${QDRANT_DEFAULT_WRITE_CONSISTENCY_FACTOR:-2}
+  healthcheck: &qdrant-health
+    # The image has no curl or wget; speak HTTP through bash's /dev/tcp.
+    test:
+      - CMD
+      - bash
+      - -c
+      - 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf "GET /readyz HTTP/1.0\r\n\r\n" >&3 && head -n1 <&3 | grep -q " 200"'
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 20s
+  logging: &logging
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+  networks: [backend]
+
+services:
+  # Node 1 is the founder: it creates the cluster the first time. A marker on its
+  # own volume stops it from silently creating a second cluster if its storage is
+  # ever lost (see config/start.sh and README "Replacing a node").
+  # Nodes 2 and 3 join through node 1 on first start and rejoin from their own
+  # Raft state afterwards, so they do not need node 1 to be up later.
+  qdrant-1:
+    <<: *qdrant
+    hostname: qdrant-1
+    environment:
+      <<: *qdrant-env
+      NODE: qdrant-1
+      FOUNDER: "1"
+      BOOTSTRAP_URL: ${QDRANT_1_BOOTSTRAP_URL:-}
+    ports:
+      - "127.0.0.1:${QDRANT_NODE_PORT_1:-7001}:6333"
+    volumes:
+      - qdrant-1-storage:/qdrant/storage
+      - qdrant-1-snapshots:/qdrant/snapshots
+      - qdrant-1-state:/qdrant/cluster-state
+      - ./config/production.yaml:/qdrant/config/production.yaml:ro
+      - ./config/start.sh:/qdrant/config/start.sh:ro
+
+  qdrant-2:
+    <<: *qdrant
+    hostname: qdrant-2
+    environment:
+      <<: *qdrant-env
+      NODE: qdrant-2
+      BOOTSTRAP_URL: http://qdrant-1:6335
+    depends_on:
+      qdrant-1: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:${QDRANT_NODE_PORT_2:-7002}:6333"
+    volumes:
+      - qdrant-2-storage:/qdrant/storage
+      - qdrant-2-snapshots:/qdrant/snapshots
+      - ./config/production.yaml:/qdrant/config/production.yaml:ro
+      - ./config/start.sh:/qdrant/config/start.sh:ro
+
+  qdrant-3:
+    <<: *qdrant
+    hostname: qdrant-3
+    environment:
+      <<: *qdrant-env
+      NODE: qdrant-3
+      BOOTSTRAP_URL: http://qdrant-1:6335
+    depends_on:
+      qdrant-1: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:${QDRANT_NODE_PORT_3:-7003}:6333"
+    volumes:
+      - qdrant-3-storage:/qdrant/storage
+      - qdrant-3-snapshots:/qdrant/snapshots
+      - ./config/production.yaml:/qdrant/config/production.yaml:ro
+      - ./config/start.sh:/qdrant/config/start.sh:ro
+
+  # Single entry point, like a load balancer in front of the cluster.
+  # REST on 6333, gRPC on 6334, HAProxy stats on 8404. Bound to localhost only.
+  haproxy:
+    image: haproxy:3.2.26-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    depends_on:
+      qdrant-1: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:${QDRANT_REST_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"
+      - "127.0.0.1:${HAPROXY_STATS_PORT:-8404}:8404"
+    healthcheck:
+      # Goes through to a Qdrant node, so it is healthy only if traffic can flow.
+      test: [CMD, wget, -qO-, "http://127.0.0.1:6333/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    networks: [backend]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - source: qdrant_read_only_api_key
+        target: qdrant_api_key
+    healthcheck:
+      test: [CMD, wget, -qO-, "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    networks: [backend]
+
+  # Opt-in (host metrics need a read-only mount of the host root):
+  #   COMPOSE_PROFILES=host-metrics docker compose up -d
+  # On Docker Desktop this describes the Linux VM, not your laptop.
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    profiles: [host-metrics]
+    restart: unless-stopped
+    mem_limit: 64m
+    command: [--path.rootfs=/host, --collector.disable-defaults, --collector.cpu, --collector.meminfo, --collector.filesystem, --collector.diskstats, --collector.netdev, --collector.loadavg]
+    volumes:
+      - /:/host:ro,rslave
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    networks: [backend]
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    restart: unless-stopped
+    mem_limit: 512m
+    depends_on:
+      prometheus: { condition: service_healthy }
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run `make init` first}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/qdrant.json
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: [CMD, wget, -qO-, "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    networks: [backend]
+
+secrets:
+  qdrant_read_only_api_key:
+    file: ./secrets/qdrant_read_only_api_key
+
+networks:
+  backend:
+
+volumes:
+  qdrant-1-storage:
+  qdrant-1-snapshots:
+  qdrant-1-state:
+  qdrant-2-storage:
+  qdrant-2-snapshots:
+  qdrant-3-storage:
+  qdrant-3-snapshots:
+  prometheus-data:
+  grafana-data:

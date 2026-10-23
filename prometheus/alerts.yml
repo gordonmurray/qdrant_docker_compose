@@ -1,0 +1,83 @@
+groups:
+  - name: qdrant
+    rules:
+      - alert: QdrantNodeDown
+        expr: up{job="qdrant"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Qdrant node {{ $labels.node }} is down"
+
+      - alert: QdrantClusterPeersMissing
+        expr: min(cluster_peers_total) < 3
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "A node sees fewer than 3 cluster peers"
+          description: "Expected 3 peers, lowest view is {{ $value }}. Quorum is lost when 2 of 3 are gone."
+
+      - alert: QdrantDeadReplicas
+        expr: max(collection_dead_replicas) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} shard replicas are not serving"
+
+      - alert: QdrantPendingOperations
+        expr: cluster_pending_operations_total > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} has had pending Raft operations for 5m"
+
+      - alert: QdrantNoRaftVoters
+        expr: absent(cluster_voter{job="qdrant"} == 1)
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "No Qdrant node reports being a Raft voter"
+
+      - alert: QdrantHighErrorRate
+        expr: |
+          sum by (node) (rate(rest_responses_total{status=~"5.."}[5m]))
+            / sum by (node) (rate(rest_responses_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 5% of REST responses on {{ $labels.node }} are 5xx"
+
+      - alert: QdrantSlowSearch
+        expr: |
+          histogram_quantile(0.99, sum by (le, node) (
+            rate(rest_responses_duration_seconds_bucket{endpoint=~".*/points/search|.*/points/query"}[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p99 search latency above 1s on {{ $labels.node }}"
+
+  - name: haproxy
+    rules:
+      - alert: HAProxyBackendServerDown
+        expr: haproxy_server_status{state="DOWN", proxy=~"qdrant_.*"} == 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "HAProxy marks {{ $labels.server }} down in {{ $labels.proxy }}"
+
+  - name: host
+    rules:
+      - alert: HostDiskAlmostFull
+        expr: |
+          1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint="/"} /
+              node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint="/"} > 0.85
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Docker host disk is over 85% full"
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Docker host has under 10% memory available"
